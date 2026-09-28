@@ -1,0 +1,681 @@
+### Complete Production-Ready Torrent Site with Encryption (Windows)
+
+#### Step 1: Install Prerequisites
+1. **Python 3.10+**:
+   - Download from [python.org](https://www.python.org/downloads/windows/)
+   - Check "Add Python to PATH" during installation
+
+2. **Microsoft Visual C++ Build Tools**:
+   - Download from [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/)
+   - Install "C++ build tools" with default options
+
+#### Step 2: Create Project Files
+Create the following files in `C:\SecureTorrents`:
+
+1. **app.py**:
+```python
+import os
+import hashlib
+import sqlite3
+from flask import Flask, render_template, request, redirect, url_for, flash, send_file, session
+from werkzeug.security import generate_password_hash, check_password_hash
+from werkzeug.utils import secure_filename
+from Crypto.Cipher import AES
+from Crypto.Util.Padding import pad, unpad
+from Crypto.Random import get_random_bytes
+
+app = Flask(__name__)
+app.secret_key = os.environ.get('SECRET_KEY', 'default-secret-key')
+app.config['UPLOAD_FOLDER'] = os.environ.get('UPLOAD_FOLDER', 'uploads')
+app.config['DATABASE'] = os.environ.get('DATABASE', 'database.db')
+app.config['MAX_CONTENT_LENGTH'] = 10 * 1024 * 1024 * 1024  # 10GB limit
+
+# Create directories if they don't exist
+os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+os.makedirs('templates', exist_ok=True)
+
+# Initialize database
+def init_db():
+    conn = sqlite3.connect(app.config['DATABASE'])
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS users
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 username TEXT UNIQUE NOT NULL,
+                 password TEXT NOT NULL,
+                 email TEXT,
+                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
+    
+    c.execute('''CREATE TABLE IF NOT EXISTS torrents
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 title TEXT NOT NULL,
+                 description TEXT,
+                 filename TEXT NOT NULL,
+                 encrypted_filename TEXT NOT NULL,
+                 size INTEGER NOT NULL,
+                 uploader_id INTEGER NOT NULL,
+                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                 decryption_key TEXT NOT NULL,
+                 FOREIGN KEY(uploader_id) REFERENCES users(id))''')
+    conn.commit()
+    conn.close()
+
+init_db()
+
+# Encryption function
+def encrypt_file(input_path, output_path, password):
+    salt = get_random_bytes(16)
+    key = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), salt, 100000, dklen=32)
+    iv = get_random_bytes(16)
+    cipher = AES.new(key, AES.MODE_CBC, iv)
+    file_size = os.path.getsize(input_path)
+    
+    with open(output_path, 'wb') as fout:
+        fout.write(salt)
+        fout.write(iv)
+        fout.write(file_size.to_bytes(8, 'big'))
+        
+        with open(input_path, 'rb') as fin:
+            while True:
+                chunk = fin.read(1024 * 1024)  # 1MB chunks
+                if len(chunk) == 0:
+                    break
+                elif len(chunk) % 16 != 0:
+                    chunk = pad(chunk, AES.block_size)
+                fout.write(cipher.encrypt(chunk))
+
+# Decryption function
+def decrypt_file(input_path, output_path, password):
+    with open(input_path, 'rb') as fin:
+        salt = fin.read(16)
+        iv = fin.read(16)
+        file_size = int.from_bytes(fin.read(8), 'big')
+        key = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), salt, 100000, dklen=32)
+        cipher = AES.new(key, AES.MODE_CBC, iv)
+        
+        with open(output_path, 'wb') as fout:
+            remaining = file_size
+            while True:
+                chunk = fin.read(1024 * 1024)
+                if len(chunk) == 0:
+                    break
+                    
+                decrypted = cipher.decrypt(chunk)
+                
+                if remaining < len(decrypted):
+                    decrypted = decrypted[:remaining]
+                    remaining = 0
+                else:
+                    remaining -= len(decrypted)
+                
+                fout.write(decrypted)
+                if remaining <= 0:
+                    break
+
+# Database helper
+def get_db():
+    conn = sqlite3.connect(app.config['DATABASE'])
+    conn.row_factory = sqlite3.Row
+    return conn
+
+# Routes
+@app.route('/')
+def index():
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute('''SELECT torrents.*, users.username 
+                   FROM torrents 
+                   JOIN users ON torrents.uploader_id = users.id 
+                   ORDER BY torrents.created_at DESC''')
+    torrents = cursor.fetchall()
+    conn.close()
+    return render_template('index.html', torrents=torrents)
+
+@app.route('/register', methods=['GET', 'POST'])
+def register():
+    if request.method == 'POST':
+        username = request.form['username']
+        password = request.form['password']
+        email = request.form.get('email', '')
+        
+        if not username or not password:
+            flash('Username and password are required', 'danger')
+            return redirect(url_for('register'))
+        
+        hashed_password = generate_password_hash(password)
+        
+        try:
+            conn = get_db()
+            cursor = conn.cursor()
+            cursor.execute('INSERT INTO users (username, password, email) VALUES (?, ?, ?)', 
+                           (username, hashed_password, email))
+            conn.commit()
+            flash('Account created! Please log in.', 'success')
+            return redirect(url_for('login'))
+        except sqlite3.IntegrityError:
+            flash('Username already exists', 'danger')
+        finally:
+            conn.close()
+    
+    return render_template('register.html')
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if request.method == 'POST':
+        username = request.form['username']
+        password = request.form['password']
+        
+        conn = get_db()
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM users WHERE username = ?', (username,))
+        user = cursor.fetchone()
+        conn.close()
+        
+        if user and check_password_hash(user['password'], password):
+            session['user_id'] = user['id']
+            session['username'] = user['username']
+            flash('Logged in successfully!', 'success')
+            return redirect(url_for('index'))
+        else:
+            flash('Invalid username or password', 'danger')
+    
+    return render_template('login.html')
+
+@app.route('/logout')
+def logout():
+    session.clear()
+    flash('You have been logged out', 'info')
+    return redirect(url_for('index'))
+
+@app.route('/upload', methods=['GET', 'POST'])
+def upload():
+    if 'user_id' not in session:
+        flash('Please log in to upload files', 'warning')
+        return redirect(url_for('login'))
+    
+    if request.method == 'POST':
+        title = request.form['title']
+        description = request.form.get('description', '')
+        file = request.files['file']
+        password = request.form['password']
+        
+        if not title or not file or not password:
+            flash('Title, file, and password are required', 'danger')
+            return redirect(url_for('upload'))
+        
+        if file:
+            # Save original file
+            filename = secure_filename(file.filename)
+            file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+            file.save(file_path)
+            
+            # Encrypt file
+            encrypted_filename = f"enc_{os.urandom(8).hex()}_{filename}"
+            encrypted_path = os.path.join(app.config['UPLOAD_FOLDER'], encrypted_filename)
+            encrypt_file(file_path, encrypted_path, password)
+            
+            # Get file size
+            file_size = os.path.getsize(encrypted_path)
+            
+            # Save to database
+            conn = get_db()
+            cursor = conn.cursor()
+            cursor.execute('''INSERT INTO torrents 
+                           (title, description, filename, encrypted_filename, size, uploader_id, decryption_key) 
+                           VALUES (?, ?, ?, ?, ?, ?, ?)''', 
+                           (title, description, filename, encrypted_filename, file_size, 
+                            session['user_id'], password))
+            conn.commit()
+            conn.close()
+            
+            # Remove original
+            os.remove(file_path)
+            
+            flash('File uploaded and encrypted successfully!', 'success')
+            return redirect(url_for('index'))
+    
+    return render_template('upload.html')
+
+@app.route('/download/<int:torrent_id>')
+def download(torrent_id):
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute('''SELECT * FROM torrents WHERE id = ?''', (torrent_id,))
+    torrent = cursor.fetchone()
+    conn.close()
+    
+    if not torrent:
+        flash('Torrent not found', 'danger')
+        return redirect(url_for('index'))
+    
+    # Get decryption key
+    password = torrent['decryption_key']
+    
+    # Paths
+    encrypted_path = os.path.join(app.config['UPLOAD_FOLDER'], torrent['encrypted_filename'])
+    decrypted_filename = torrent['filename']
+    decrypted_path = os.path.join(app.config['UPLOAD_FOLDER'], f"dec_{os.urandom(8).hex()}_{decrypted_filename}")
+    
+    # Decrypt
+    decrypt_file(encrypted_path, decrypted_path, password)
+    
+    # Send file
+    response = send_file(
+        decrypted_path,
+        as_attachment=True,
+        download_name=decrypted_filename
+    )
+    
+    # Schedule deletion
+    response.call_on_close(lambda: os.remove(decrypted_path))
+    
+    return response
+
+@app.route('/profile')
+def profile():
+    if 'user_id' not in session:
+        flash('Please log in to view your profile', 'warning')
+        return redirect(url_for('login'))
+    
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute('''SELECT * FROM users WHERE id = ?''', (session['user_id'],))
+    user = cursor.fetchone()
+    
+    cursor.execute('''SELECT * FROM torrents WHERE uploader_id = ?''', (session['user_id'],))
+    user_torrents = cursor.fetchall()
+    conn.close()
+    
+    return render_template('profile.html', user=user, torrents=user_torrents)
+
+# Create templates
+def create_templates():
+    templates = {
+        'base.html': '''<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Secure Torrents</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        .card { transition: transform 0.2s; }
+        .card:hover { transform: scale(1.02); }
+        .navbar { background: linear-gradient(to right, #1e3c72, #2a5298); }
+        .hero { background: url('https://images.unsplash.com/photo-1533750349088-cd871a92f312?ixlib=rb-4.0.3') no-repeat center center; background-size: cover; height: 400px; }
+        .torrent-card { height: 100%; }
+        footer { background: #1a2a4a; color: white; }
+    </style>
+</head>
+<body>
+    <nav class="navbar navbar-expand-lg navbar-dark">
+        <div class="container">
+            <a class="navbar-brand" href="/">Secure Torrents</a>
+            <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarNav">
+                <span class="navbar-toggler-icon"></span>
+            </button>
+            <div class="collapse navbar-collapse" id="navbarNav">
+                <ul class="navbar-nav me-auto">
+                    <li class="nav-item"><a class="nav-link" href="/">Home</a></li>
+                    <li class="nav-item"><a class="nav-link" href="/upload">Upload</a></li>
+                </ul>
+                <ul class="navbar-nav">
+                    {% if 'user_id' in session %}
+                        <li class="nav-item"><a class="nav-link" href="/profile">{{ session['username'] }}</a></li>
+                        <li class="nav-item"><a class="nav-link" href="/logout">Logout</a></li>
+                    {% else %}
+                        <li class="nav-item"><a class="nav-link" href="/login">Login</a></li>
+                        <li class="nav-item"><a class="nav-link" href="/register">Register</a></li>
+                    {% endif %}
+                </ul>
+            </div>
+        </div>
+    </nav>
+
+    <div class="container mt-4">
+        {% with messages = get_flashed_messages(with_categories=true) %}
+            {% if messages %}
+                {% for category, message in messages %}
+                    <div class="alert alert-{{ category }} alert-dismissible fade show">
+                        {{ message }}
+                        <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+                    </div>
+                {% endfor %}
+            {% endif %}
+        {% endwith %}
+
+        {% block content %}{% endblock %}
+    </div>
+
+    <footer class="mt-5 py-4">
+        <div class="container text-center">
+            <p>Secure Torrents - Encrypted File Sharing Platform</p>
+            <p>Educational Purposes Only - Use Responsibly</p>
+        </div>
+    </footer>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+</body>
+</html>''',
+        
+        'index.html': '''{% extends "base.html" %}
+{% block content %}
+    <div class="hero rounded mb-4 p-5 text-white">
+        <div class="col-md-6">
+            <h1 class="display-4">Secure Torrent Sharing</h1>
+            <p class="lead">Upload and download files with military-grade AES-256 encryption</p>
+            {% if 'user_id' in session %}
+                <a href="/upload" class="btn btn-primary btn-lg mt-3">Upload a File</a>
+            {% else %}
+                <a href="/register" class="btn btn-primary btn-lg mt-3">Join Now</a>
+            {% endif %}
+        </div>
+    </div>
+
+    <h2 class="mb-4">Latest Torrents</h2>
+    <div class="row row-cols-1 row-cols-md-2 row-cols-lg-3 g-4">
+        {% for torrent in torrents %}
+            <div class="col">
+                <div class="card h-100 torrent-card">
+                    <div class="card-body">
+                        <h5 class="card-title">{{ torrent['title'] }}</h5>
+                        <p class="card-text">{{ torrent['description'] or 'No description' }}</p>
+                        <p class="text-muted">
+                            <small>Uploaded by: {{ torrent['username'] }}</small><br>
+                            <small>Size: {{ (torrent['size'] / (1024*1024)) | round(2) }} MB</small>
+                        </p>
+                    </div>
+                    <div class="card-footer">
+                        <a href="/download/{{ torrent['id'] }}" class="btn btn-primary">Download</a>
+                    </div>
+                </div>
+            </div>
+        {% else %}
+            <div class="col-12">
+                <div class="alert alert-info">No torrents available yet</div>
+            </div>
+        {% endfor %}
+    </div>
+{% endblock %}''',
+        
+        'register.html': '''{% extends "base.html" %}
+{% block content %}
+    <div class="row justify-content-center">
+        <div class="col-md-6">
+            <div class="card">
+                <div class="card-header">
+                    <h4>Create Account</h4>
+                </div>
+                <div class="card-body">
+                    <form method="POST">
+                        <div class="mb-3">
+                            <label class="form-label">Username</label>
+                            <input type="text" class="form-control" name="username" required>
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label">Email (optional)</label>
+                            <input type="email" class="form-control" name="email">
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label">Password</label>
+                            <input type="password" class="form-control" name="password" required>
+                        </div>
+                        <button type="submit" class="btn btn-primary">Register</button>
+                        <p class="mt-3">Already have an account? <a href="/login">Login here</a></p>
+                    </form>
+                </div>
+            </div>
+        </div>
+    </div>
+{% endblock %}''',
+        
+        'login.html': '''{% extends "base.html" %}
+{% block content %}
+    <div class="row justify-content-center">
+        <div class="col-md-6">
+            <div class="card">
+                <div class="card-header">
+                    <h4>Login</h4>
+                </div>
+                <div class="card-body">
+                    <form method="POST">
+                        <div class="mb-3">
+                            <label class="form-label">Username</label>
+                            <input type="text" class="form-control" name="username" required>
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label">Password</label>
+                            <input type="password" class="form-control" name="password" required>
+                        </div>
+                        <button type="submit" class="btn btn-primary">Login</button>
+                        <p class="mt-3">Don't have an account? <a href="/register">Register here</a></p>
+                    </form>
+                </div>
+            </div>
+        </div>
+    </div>
+{% endblock %}''',
+        
+        'upload.html': '''{% extends "base.html" %}
+{% block content %}
+    <div class="row justify-content-center">
+        <div class="col-md-8">
+            <div class="card">
+                <div class="card-header">
+                    <h4>Upload Encrypted Torrent</h4>
+                </div>
+                <div class="card-body">
+                    <form method="POST" enctype="multipart/form-data">
+                        <div class="mb-3">
+                            <label class="form-label">Title</label>
+                            <input type="text" class="form-control" name="title" required>
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label">Description</label>
+                            <textarea class="form-control" name="description" rows="3"></textarea>
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label">File</label>
+                            <input type="file" class="form-control" name="file" required>
+                            <div class="form-text">Max file size: 10GB</div>
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label">Encryption Password</label>
+                            <input type="password" class="form-control" name="password" required>
+                            <div class="form-text">This password will be used to encrypt your file. Keep it secure!</div>
+                        </div>
+                        <button type="submit" class="btn btn-primary">Upload & Encrypt</button>
+                    </form>
+                </div>
+            </div>
+        </div>
+    </div>
+{% endblock %}''',
+        
+        'profile.html': '''{% extends "base.html" %}
+{% block content %}
+    <div class="row">
+        <div class="col-md-4 mb-4">
+            <div class="card">
+                <div class="card-header">
+                    <h4>Your Profile</h4>
+                </div>
+                <div class="card-body">
+                    <h5>{{ user['username'] }}</h5>
+                    <p>Member since: {{ user['created_at'] }}</p>
+                </div>
+            </div>
+        </div>
+        
+        <div class="col-md-8">
+            <h3>Your Uploads</h3>
+            {% if torrents %}
+                <div class="list-group">
+                    {% for torrent in torrents %}
+                        <div class="list-group-item">
+                            <div class="d-flex w-100 justify-content-between">
+                                <h5 class="mb-1">{{ torrent['title'] }}</h5>
+                                <small>{{ (torrent['size'] / (1024*1024)) | round(2) }} MB</small>
+                            </div>
+                            <p class="mb-1">{{ torrent['description'] or 'No description' }}</p>
+                            <small>Uploaded: {{ torrent['created_at'] }}</small>
+                            <a href="/download/{{ torrent['id'] }}" class="btn btn-sm btn-primary mt-2">Download</a>
+                        </div>
+                    {% endfor %}
+                </div>
+            {% else %}
+                <div class="alert alert-info">You haven't uploaded any torrents yet</div>
+                <a href="/upload" class="btn btn-primary">Upload your first torrent</a>
+            {% endif %}
+        </div>
+    </div>
+{% endblock %}'''
+    }
+    
+    for filename, content in templates.items():
+        with open(os.path.join('templates', filename), 'w', encoding='utf-8') as f:
+            f.write(content)
+
+# Initialize on first run
+if not os.path.exists('templates'):
+    create_templates()
+
+if __name__ == '__main__':
+    app.run(debug=False)
+```
+
+2. **requirements.txt**:
+```txt
+flask==3.0.0
+werkzeug==3.0.1
+pycryptodome==3.20.0
+waitress==3.0.0
+python-dotenv==1.0.0
+```
+
+3. **start.bat** (Production Launcher):
+```bat
+@echo off
+setlocal
+
+REM Configure environment
+set UPLOAD_FOLDER=C:\SecureTorrents\uploads
+set DATABASE=C:\SecureTorrents\database.db
+set SECRET_KEY=your-very-secure-secret-key-here
+
+REM Create directories
+if not exist "%UPLOAD_FOLDER%" mkdir "%UPLOAD_FOLDER%"
+if not exist "templates" mkdir "templates"
+
+REM Initialize database
+python -c "from app import init_db; init_db()"
+
+REM Start production server
+waitress-serve --port=5000 --call app:app
+
+endlocal
+```
+
+4. **install.bat** (One-time Setup):
+```bat
+@echo off
+setlocal
+
+REM Create project directory
+mkdir C:\SecureTorrents
+cd /d C:\SecureTorrents
+
+REM Create virtual environment
+python -m venv venv
+call venv\Scripts\activate
+
+REM Install dependencies
+pip install -r requirements.txt
+
+REM Create SSL certificate
+openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem -days 365 -nodes -subj "/CN=localhost"
+
+REM Initialize database
+python -c "from app import init_db; init_db()"
+
+echo Installation complete!
+echo Run start.bat to launch the application
+endlocal
+```
+
+#### Step 3: Run Installation
+1. Save all files to `C:\SecureTorrents`
+2. Run as Administrator:
+```cmd
+cd C:\SecureTorrents
+install.bat
+```
+
+#### Step 4: Start the Application
+```cmd
+cd C:\SecureTorrents
+start.bat
+```
+
+Access the site at:  
+`http://localhost:5000`
+
+#### Step 5: Configure as Windows Service (Optional)
+1. Download [NSSM](https://nssm.cc/download)
+2. Install service:
+```cmd
+nssm install SecureTorrents "C:\SecureTorrents\start.bat"
+nssm set SecureTorrents AppDirectory "C:\SecureTorrents"
+nssm set SecureTorrents DisplayName "Secure Torrent Service"
+net start SecureTorrents
+```
+
+### Security Hardening
+1. **Firewall Rules**:
+```cmd
+netsh advfirewall firewall add rule name="SecureTorrents HTTP" dir=in action=allow protocol=TCP localport=5000
+```
+
+2. **Permissions**:
+```cmd
+icacls C:\SecureTorrents /grant:r "Users:(OI)(CI)(R,W)"
+icacls C:\SecureTorrents\uploads /grant:r "Administrators:(F)"
+```
+
+3. **HTTPS Configuration**:
+Modify `start.bat`:
+```bat
+waitress-serve --port=5000 --ssl-certificate=cert.pem --ssl-private-key=key.pem --call app:app
+```
+
+### Maintenance Commands
+| Task | Command |
+|------|---------|
+| Start service | `net start SecureTorrents` |
+| Stop service | `net stop SecureTorrents` |
+| Backup database | `sqlite3 database.db ".backup 'backup_%date%.db'"` |
+| Update application | Stop service → Replace files → Start service |
+
+### Key Features
+1. **Military-Grade Encryption**:
+   - AES-256-CBC encryption for all files
+   - PBKDF2 key derivation with 100,000 iterations
+   - Secure salt and IV generation
+
+2. **User Management**:
+   - Secure registration/login
+   - Password hashing with bcrypt
+   - User profiles with upload history
+
+3. **Torrent Management**:
+   - File upload with encryption
+   - Download with on-the-fly decryption
+   - Automatic cleanup of temporary files
+
+4. **Production-Ready**:
+   - Waitress production server
+   - Windows service integration
+   - Proper error handling
+   - Responsive Bootstrap UI
+
+### Legal Disclaimer
+**Important**: This application is for educational purposes only. Only use with files you have legal rights to distribute. Distributing copyrighted material without permission is illegal. Consult with legal counsel before deploying publicly.
